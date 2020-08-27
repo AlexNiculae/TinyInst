@@ -54,6 +54,7 @@ void RunTarget(int argc, char **argv, unsigned int pid, uint32_t timeout) {
     }
   }
 
+
   // if target function is defined,
   // we should wait until it is hit
   if (instrumentation->IsTargetFunctionDefined()) {

@@ -22,7 +22,12 @@ limitations under the License.
 #include <unordered_map>
 #include <unordered_set>
 
-#include "Windows/debugger.h"
+#if defined(WIN32) || defined(_WIN32) || defined(__WIN32)
+  #include "Windows/debugger.h"
+#elif __APPLE__
+  #include "macOS/Debugger.h"
+#endif
+
 #include "common.h"
 
 // must be a power of two
@@ -38,7 +43,7 @@ typedef struct xed_decoded_inst_s xed_decoded_inst_t;
 
 class TinyInst : public Debugger {
 public:
-  virtual void Init(int argc, char **argv);
+  virtual void Init(int argc, char **argv) override;
 
 protected:
 
