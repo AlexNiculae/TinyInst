@@ -1,6 +1,6 @@
 //
-//  DebuggerMacOs.cpp
-//  DebuggerMacOs
+//  Debugger.cpp
+//  TinyInst
 //
 //  Created by Alexandru-Vlad Niculae on 06/07/2020.
 //  Copyright © 2020 Google LLC. All rights reserved.
@@ -8,7 +8,6 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <chrono>
 #include <thread>
 #include <algorithm>
 
@@ -29,16 +28,19 @@
 #include "Debugger.h"
 #include "../common.h"
 
-#define BREAKPOINT_UNKNOWN 0
-#define BREAKPOINT_ENTRYPOINT 1
-#define BREAKPOINT_TARGET 2
-#define BREAKPOINT_NOTIFICATION 3
+#define BREAKPOINT_UNKNOWN 0x0
+#define BREAKPOINT_ENTRYPOINT 0x01
+#define BREAKPOINT_TARGET 0x02
+#define BREAKPOINT_NOTIFICATION 0x04
 
 #define PERSIST_END_EXCEPTION 0x0F22
-#define TRAP_FLAG 0x0100
 #define TWO_GB_OF_MEMORY 0x80000000
 
+extern char **environ;
+#define GMALLOC_ENV_CONFIG "DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib"
+
 std::unordered_map<task_t, class Debugger*> Debugger::task_to_debugger_map;
+std::mutex Debugger::map_mutex;
 
 vm_prot_t Debugger::MacOSProtectionFlags(MemoryProtection memory_protection) {
   switch (memory_protection) {
@@ -67,7 +69,7 @@ void Debugger::RemoteRead(void *address, void *buffer, size_t size) {
   mach_target->ReadMemory((uint64_t)address, size, buffer);
 }
 
-void Debugger::RemoteWrite(void *address, void *buffer, size_t size) {
+void Debugger::RemoteWrite(void *address, const void *buffer, size_t size) {
   mach_target->WriteMemory((uint64_t)address, buffer, size);
 }
 
@@ -153,8 +155,6 @@ uint64_t* Debugger::GetPointerToRegister(Register r) {
       return &state->__r15;
     case RIP:
       return &state->__rip;
-    case RFLAGS:
-      return &state->__rflags;
 
     default:
       FATAL("Unimplemented register");
@@ -201,9 +201,13 @@ void Debugger::GetMachHeader(void *mach_header_address, mach_header_64 *mach_hea
   RemoteRead(mach_header_address, (void*)mach_header, sizeof(mach_header_64));
 }
 
-void Debugger::GetLoadCommandsBuffer(void *mach_header_address, const mach_header_64 *mach_header, void **load_commands) {
+void Debugger::GetLoadCommandsBuffer(void *mach_header_address,
+                                     const mach_header_64 *mach_header,
+                                     void **load_commands) {
   *load_commands = (void*)malloc(mach_header->sizeofcmds);
-  RemoteRead((void*)((uint64_t)mach_header_address + sizeof(mach_header_64)), *load_commands, mach_header->sizeofcmds);
+  RemoteRead((void*)((uint64_t)mach_header_address + sizeof(mach_header_64)),
+             *load_commands,
+             mach_header->sizeofcmds);
 }
 
 template <class TCMD>
@@ -284,7 +288,9 @@ void *Debugger::RemoteAllocateBefore(uint64_t min_address,
         }
 
         if (krt == KERN_NO_SPACE && !retried) {
-          krt = mach_vm_deallocate(mach_target->Task(), (mach_vm_address_t)cur_address, free_region_size);
+          krt = mach_vm_deallocate(mach_target->Task(),
+                                   (mach_vm_address_t)cur_address,
+                                   free_region_size);
           if (krt == KERN_SUCCESS) {
             retried = true;
             continue;
@@ -348,7 +354,9 @@ void *Debugger::RemoteAllocateAfter(uint64_t min_address,
       }
 
       if (krt == KERN_NO_SPACE && !retried) {
-        krt = mach_vm_deallocate(mach_target->Task(), (mach_vm_address_t)cur_address, free_region_size);
+        krt = mach_vm_deallocate(mach_target->Task(),
+                                 (mach_vm_address_t)cur_address,
+                                 free_region_size);
         if (krt == KERN_SUCCESS) {
           retried = true;
           continue;
@@ -378,8 +386,18 @@ void Debugger::DeleteBreakpoints() {
 
 
 void Debugger::AddBreakpoint(void *address, int type) {
-  Breakpoint *new_breakpoint = new Breakpoint;
+  for (auto it = breakpoints.rbegin(); it != breakpoints.rend(); ++it) {
+    if ((*it)->address == address) {
+      (*it)->type |= type;
+      if ((*it)->type & BREAKPOINT_NOTIFICATION) {
+        FATAL("Target method must not be the same as _dyld_debugger_notification");
+      }
 
+      return;
+    }
+  }
+
+  Breakpoint *new_breakpoint = new Breakpoint;
   RemoteRead(address, &(new_breakpoint->original_opcode), 1);
 
   unsigned char cc = 0xCC;
@@ -427,12 +445,12 @@ void Debugger::HandleTargetEnded() {
 
     for (int arg_index = 0; arg_index < 6 && arg_index < target_num_args; ++arg_index) {
       SetRegister(ArgumentToRegister(arg_index), (size_t)saved_args[arg_index]);
+    }
 
-      if (target_num_args > 6) {
-        RemoteWrite((void*)((uint64_t)saved_sp + child_ptr_size),
-                    saved_args + 6,
-                    child_ptr_size * (target_num_args - 6));
-      }
+    if (target_num_args > 6) {
+      RemoteWrite((void*)((uint64_t)saved_sp + child_ptr_size),
+                  saved_args + 6,
+                  child_ptr_size * (target_num_args - 6));
     }
   }
   else {
@@ -465,7 +483,6 @@ void Debugger::ExtractCodeRanges(void *base_address,
   if (text_cmd == NULL) {
     FATAL("Unable to find __TEXT command in ExtractCodeRanges\n");
   }
-
   uint64_t file_vm_slide = (uint64_t)base_address - text_cmd->vmaddr;
 
   *code_size = 0;
@@ -481,13 +498,14 @@ void Debugger::ExtractCodeRanges(void *base_address,
     if (load_cmd->cmd == LC_SEGMENT_64) {
       segment_command_64 *segment_cmd = (segment_command_64*)load_cmd;
 
-      if (!strcmp(segment_cmd->segname, "__PAGEZERO") || !strcmp(segment_cmd->segname, "__LINKEDIT")) {
+      if (!strcmp(segment_cmd->segname, "__PAGEZERO")
+          || !strcmp(segment_cmd->segname, "__LINKEDIT")) {
         load_cmd_addr += load_cmd->cmdsize;
         continue;
       }
 
       mach_vm_address_t segment_start_addr = (mach_vm_address_t)segment_cmd->vmaddr + file_vm_slide;
-      mach_vm_address_t segment_end_addr = (mach_vm_address_t)segment_cmd->vmaddr + segment_cmd->vmsize + file_vm_slide;
+      mach_vm_address_t segment_end_addr = (mach_vm_address_t)segment_cmd->vmaddr + file_vm_slide + segment_cmd->vmsize;
 
       mach_vm_address_t cur_address = segment_start_addr;
 
@@ -517,7 +535,9 @@ void Debugger::ExtractCodeRanges(void *base_address,
           RemoteRead((void*)new_range.from, new_range.data, range_size);
 
           kern_return_t krt;
-          krt = mach_vm_deallocate(mach_target->Task(), (mach_vm_address_t)new_range.from, range_size);
+          krt = mach_vm_deallocate(mach_target->Task(),
+                                   (mach_vm_address_t)new_range.from,
+                                   range_size);
 
           if (krt == KERN_SUCCESS) {
             mach_vm_address_t alloc_address = new_range.from;
@@ -544,7 +564,7 @@ void Debugger::ExtractCodeRanges(void *base_address,
           vm_region_submap_info_data_64_t region_info;
           mach_target->GetRegionSubmapInfo(&region_addr, (mach_vm_size_t*)&region_sz, &region_info);
           if (region_info.protection & VM_PROT_EXECUTE) {
-            FATAL("Failed to mark the original code to NON-EXECUTABLE\n");
+            FATAL("Failed to mark the original code NON-EXECUTABLE\n");
           }
         }
 
@@ -560,6 +580,9 @@ void Debugger::ExtractCodeRanges(void *base_address,
 
 
 void Debugger::ProtectCodeRanges(std::list<AddressRange> *executable_ranges) {
+  WARN("persist_instrumentation_data functionality was not tested on macOS."
+       "ProtectCodeRanges might fail");
+
   for (auto &range: *executable_ranges) {
     mach_vm_address_t region_address = range.from;
     mach_vm_size_t region_size = 0;
@@ -592,7 +615,8 @@ void Debugger::GetImageSize(void *base_address, size_t *min_address, size_t *max
     if (load_cmd->cmd == LC_SEGMENT_64) {
       segment_command_64 *segment_cmd = (segment_command_64*)load_cmd;
 
-      if (!strcmp(segment_cmd->segname, "__PAGEZERO") || !strcmp(segment_cmd->segname, "__LINKEDIT")) {
+      if (!strcmp(segment_cmd->segname, "__PAGEZERO")
+          || !strcmp(segment_cmd->segname, "__LINKEDIT")) {
         load_cmd_addr += load_cmd->cmdsize;
         continue;
       }
@@ -681,21 +705,20 @@ void *Debugger::GetSymbolAddress(void *base_address, char *symbol_name) {
   uint64_t file_vm_slide = (uint64_t)base_address - text_cmd->vmaddr;
 
   char *strtab = (char*)malloc(symtab_cmd->strsize);
-  uint64_t strtab_addr = linkedit_cmd->vmaddr + file_vm_slide + symtab_cmd->stroff - linkedit_cmd->fileoff;
+  uint64_t strtab_addr = linkedit_cmd->vmaddr + file_vm_slide
+                         + symtab_cmd->stroff - linkedit_cmd->fileoff;
   RemoteRead((void*)strtab_addr, strtab, symtab_cmd->strsize);
 
   void *symbol_address = NULL;
-  nlist_64 symbol;
-
   for (int i = 0; i < symtab_cmd->nsyms && !symbol_address; ++i) {
-    uint64_t nlist_addr = linkedit_cmd->vmaddr + file_vm_slide + symtab_cmd->symoff - linkedit_cmd->fileoff + i * sizeof(nlist_64);
+    uint64_t nlist_addr = linkedit_cmd->vmaddr + file_vm_slide
+                          + symtab_cmd->symoff - linkedit_cmd->fileoff + i * sizeof(nlist_64);
 
-    symbol = {0};
+    nlist_64 symbol = {0};
     RemoteRead((void*)nlist_addr, &symbol, sizeof(nlist_64));
 
     if ((symbol.n_type & N_TYPE) == N_SECT) {
       char *sym_name_start = strtab + symbol.n_un.n_strx;
-
       if (!strcmp(sym_name_start, symbol_name)) {
         symbol_address = (void*)((uint64_t)base_address - text_cmd->vmaddr + symbol.n_value);
         break;
@@ -737,7 +760,7 @@ void Debugger::OnModuleLoaded(void *module, char *module_name) {
     m_dyld_debugger_notification = GetSymbolAddress(module, (char*)"__dyld_debugger_notification");
     AddBreakpoint(m_dyld_debugger_notification, BREAKPOINT_NOTIFICATION);
 
-    // This is a hack that can save us the recurring TRAP FLAG breakpoint on BREAKPOINT_NOTIFICATION.
+    // This save us the recurring TRAP FLAG breakpoint on BREAKPOINT_NOTIFICATION.
     unsigned char c3 = 0xC3;
     RemoteWrite((void*)((uint64_t)m_dyld_debugger_notification+1), (void*)&c3, 1);
   }
@@ -765,9 +788,7 @@ void Debugger::OnDyldImageNotifier(size_t mode, unsigned long infoCount, uint64_
   }
   else {
     kern_return_t krt;
-    dyld_process_info info =
-        m_dyld_process_info_create(mach_target->Task(), 0, &krt);
-
+    dyld_process_info info = m_dyld_process_info_create(mach_target->Task(), 0, &krt);
     if (krt != KERN_SUCCESS) {
       FATAL("Unable to retrieve dyld_process_info_create information\n");
     }
@@ -777,11 +798,10 @@ void Debugger::OnDyldImageNotifier(size_t mode, unsigned long infoCount, uint64_
         info,
         ^(uint64_t mach_header_addr, const uuid_t uuid, const char *path) {
           if (mode == 2) { /* dyld_notify_remove_all */
-            // TO DO - test this
-            printf("******dyld_notify_remove_all received\n\n");
             OnModuleUnloaded((void*)mach_header_addr);
           }
-          else if (std::find(image_info_array, image_info_array + infoCount, mach_header_addr) != image_info_array + infoCount) {
+          else if (std::find(image_info_array, image_info_array + infoCount, mach_header_addr)
+                   != image_info_array + infoCount) {
             /* dyld_image_adding */
             char *base_name = strrchr((char*)path, '/');
             base_name = (base_name) ? base_name + 1 : (char*)path;
@@ -797,10 +817,12 @@ void Debugger::OnDyldImageNotifier(size_t mode, unsigned long infoCount, uint64_
 }
 
 void Debugger::OnProcessCreated() {
-  kern_return_t krt;
-  dyld_process_info info =
-      m_dyld_process_info_create(mach_target->Task(), 0, &krt);
+  if (trace_debug_events) {
+    SAY("Debugger: Process created or attached\n");
+  }
 
+  kern_return_t krt;
+  dyld_process_info info = m_dyld_process_info_create(mach_target->Task(), 0, &krt);
   if (krt != KERN_SUCCESS) {
     FATAL("Unable to retrieve dyld_process_info_create information\n");
   }
@@ -829,7 +851,7 @@ int Debugger::HandleDebuggerBreakpoint() {
     tmp_breakpoint = *iter;
     if (tmp_breakpoint->address == (void*)((uint64_t)last_exception.ip)) {
       breakpoint = tmp_breakpoint;
-      if (breakpoint->type == BREAKPOINT_NOTIFICATION) {
+      if (breakpoint->type & BREAKPOINT_NOTIFICATION) {
         OnDyldImageNotifier(GetRegister(ArgumentToRegister(0)),
                             (unsigned long)GetRegister(ArgumentToRegister(1)),
                             (uint64_t*)GetRegister(ArgumentToRegister(2)));
@@ -849,21 +871,15 @@ int Debugger::HandleDebuggerBreakpoint() {
   RemoteWrite(breakpoint->address, &breakpoint->original_opcode, 1);
   SetRegister(RIP, GetRegister(RIP) - 1); //INTEL
 
-  switch (breakpoint->type) {
-    case BREAKPOINT_ENTRYPOINT:
+  if (breakpoint->type & BREAKPOINT_ENTRYPOINT) {
       OnEntrypoint();
-      break;
+  }
 
-    case BREAKPOINT_TARGET:
+  if (breakpoint->type & BREAKPOINT_TARGET) {
       if (trace_debug_events) {
         SAY("Target method reached\n");
       }
-
       HandleTargetReachedInternal();
-      break;
-
-    default:
-      break;
   }
 
   ret = breakpoint->type;
@@ -873,7 +889,6 @@ int Debugger::HandleDebuggerBreakpoint() {
 }
 
 
-//TO DO - fix mach exception address
 void Debugger::HandleExceptionInternal(MachException *raised_mach_exception) {
   mach_exception = raised_mach_exception;
   CreateException(mach_exception, &last_exception);
@@ -883,11 +898,11 @@ void Debugger::HandleExceptionInternal(MachException *raised_mach_exception) {
 
   if (mach_exception->exception_type == EXC_BREAKPOINT) {
     int breakpoint_type = HandleDebuggerBreakpoint();
-    if (breakpoint_type == BREAKPOINT_TARGET) {
+    if (breakpoint_type & BREAKPOINT_TARGET) {
       ret_HandleExceptionInternal = DEBUGGER_TARGET_START;
-      return;
     }
-    else if (breakpoint_type != BREAKPOINT_UNKNOWN) {
+
+    if (breakpoint_type != BREAKPOINT_UNKNOWN) {
       return;
     }
   }
@@ -897,7 +912,8 @@ void Debugger::HandleExceptionInternal(MachException *raised_mach_exception) {
   }
 
   if (trace_debug_events) {
-    SAY("Debugger: Mach exception %d at address %p\n", mach_exception->exception_type, last_exception.ip);
+    SAY("Debugger: Mach exception (%d) @ address %p\n",
+        mach_exception->exception_type, last_exception.ip);
   }
 
   switch(mach_exception->exception_type) {
@@ -955,10 +971,6 @@ void Debugger::HandleExceptionInternal(MachException *raised_mach_exception) {
         /* Handling the Unix soft signal produced by attaching via ptrace
           PT_ATTACHEXC suspends the process by using a SIGSTOP signal */
         case SIGSTOP:
-          if (trace_debug_events) {
-            SAY("Debugger: Process created or attached\n");
-          }
-
           OnProcessCreated();
 
           mach_exception->code[1] = 0;
@@ -969,16 +981,12 @@ void Debugger::HandleExceptionInternal(MachException *raised_mach_exception) {
 
           break;
 
+        case SIGCHLD:
+          ret_HandleExceptionInternal = DEBUGGER_PROCESS_EXIT;
+          break;
+
         default:
           goto default_label;
-
-        case SIGCHLD:
-          if (trace_debug_events) {
-            SAY("Debugger: Process exit\n");
-          }
-
-          ret_HandleExceptionInternal = DEBUGGER_PROCESS_EXIT;
-          OnProcessExit();
       }
 
       break;
@@ -986,7 +994,8 @@ void Debugger::HandleExceptionInternal(MachException *raised_mach_exception) {
     default:
     default_label:
       if (trace_debug_events) {
-        WARN("Debugger: Unhandled exception, mach exception_type %x at address %p\n", mach_exception->exception_type, last_exception.ip);
+        WARN("Debugger: Unhandled exception, mach exception_type %x at address %p\n",
+             mach_exception->exception_type, last_exception.ip);
       }
       dbg_continue_status = KERN_FAILURE;
   }
@@ -994,73 +1003,72 @@ void Debugger::HandleExceptionInternal(MachException *raised_mach_exception) {
 
 
 DebuggerStatus Debugger::DebugLoop(uint32_t timeout) {
-  if (mach_target->ExceptionPortIsValid() && dbg_continue_needed) {
-    task_resume(mach_target->Task());
-    mach_target->ReplyToException(reply_buffer);
+  if (IsTargetAlive()) {
+    if (dbg_continue_needed) {
+      task_resume(mach_target->Task());
+    }
+
+    if (dbg_reply_needed) {
+      mach_target->ReplyToException(reply_buffer);
+    }
   }
 
   bool alive = true;
   while (alive) {
     dbg_continue_needed = false;
+    dbg_reply_needed = false;
 
-    std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
-    int wait_time = (timeout > 100) ? 100 : timeout;
-    kern_return_t krt = mach_target->WaitForException(wait_time, request_buffer,
+    uint64_t begin_time = GetCurTime();
+    kern_return_t krt = mach_target->WaitForException(std::min(timeout, (uint32_t)100),
+                                                      request_buffer,
                                                       sizeof(union __RequestUnion__catch_mach_exc_subsystem));
-    std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+    uint64_t end_time = GetCurTime();
 
-    task_suspend(mach_target->Task());
-
-    long long time_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
-    timeout = (1LL * timeout >= time_elapsed) ? timeout - (uint32_t)time_elapsed : 0;
+    uint64_t time_elapsed = end_time - begin_time;
+    timeout = ((uint64_t)timeout >= time_elapsed) ? timeout - (uint32_t)time_elapsed : 0;
 
     switch (krt) {
       case MACH_RCV_TIMED_OUT:
         if (timeout == 0) {
+          task_suspend(mach_target->Task());
+          dbg_continue_needed = true;
           return DEBUGGER_HANGED;
         }
-
-        if (!mach_target->TaskIsValid() || !mach_target->ExceptionPortIsValid()) {
-          goto exit_label;
-        }
-
-        continue;
+        //go down into the MACH_RCV_INTERRUPTED case otherwise
 
       case MACH_RCV_INTERRUPTED:
-        if (mach_target->TaskIsValid() && mach_target->ExceptionPortIsValid()) {
-          continue;
+        if (!mach_target->TaskIsValid() || !mach_target->ExceptionPortIsValid()) {
+          alive = false;
         }
 
-      exit_label:
-        if (trace_debug_events) {
-          SAY("Debugger: Process exit\n");
-        }
-
-        OnProcessExit();
-        alive = false;
         continue;
 
       default:
         if (krt != MACH_MSG_SUCCESS) {
-          FATAL("mach_msg returned with error code: %d\n", krt);
+          FATAL("Error (%s) returned by mach_msg\n", mach_error_string(krt));
         }
-
-        break;
     }
 
-    /* mach_exc_server calls catch_mach_exception_raise */
-    /* HandleExceptionInternal returns in ret_HandleExceptionInternal */
-
-    boolean_t message_parsed_correctly = mach_exc_server(request_buffer, reply_buffer);
+    task_suspend(mach_target->Task());
     dbg_continue_needed = true;
 
+    /* mach_exc_server calls catch_mach_exception_raise
+       HandleExceptionInternal returns in ret_HandleExceptionInternal */
+    boolean_t message_parsed_correctly = mach_exc_server(request_buffer, reply_buffer);
     if (!message_parsed_correctly) {
       krt = ((mig_reply_error_t *)reply_buffer)->RetCode;
-      FATAL("catch_mach_exception_raise returned with error code: %d\n", krt);
+      FATAL("Error (%s) returned in reply buffer by mach_exc_server\n", mach_error_string(krt));
     }
+
+    dbg_reply_needed = true;
 
     if (ret_HandleExceptionInternal == DEBUGGER_CRASHED) {
       OnCrashed(&last_exception);
+    }
+
+    if (ret_HandleExceptionInternal == DEBUGGER_PROCESS_EXIT) {
+      alive = false;
+      continue;
     }
 
     if (ret_HandleExceptionInternal != DEBUGGER_CONTINUE) {
@@ -1071,6 +1079,7 @@ DebuggerStatus Debugger::DebugLoop(uint32_t timeout) {
     mach_target->ReplyToException(reply_buffer);
   }
 
+  OnProcessExit();
   return DEBUGGER_PROCESS_EXIT;
 }
 
@@ -1127,50 +1136,76 @@ kern_return_t catch_mach_exception_raise_state_identity(
   *new_stateCnt = old_stateCnt;
 
   Debugger::MachException *mach_exception = new Debugger::MachException(exception_port,
-                                                                                  thread_port,
-                                                                                  task_port,
-                                                                                  exception_type,
-                                                                                  code,
-                                                                                  codeCnt,
-                                                                                  flavor,
-                                                                                  new_state,
-                                                                                  new_stateCnt);
+                                                                        thread_port,
+                                                                        task_port,
+                                                                        exception_type,
+                                                                        code,
+                                                                        codeCnt,
+                                                                        flavor,
+                                                                        new_state,
+                                                                        new_stateCnt);
 
 
-
+  Debugger::map_mutex.lock();
+  if (Debugger::task_to_debugger_map.find(task_port) == Debugger::task_to_debugger_map.end()
+      || Debugger::task_to_debugger_map[task_port] == NULL) {
+    FATAL("Debugger object could not be found in the map, task port = (%d)\n", task_port);
+  }
   class Debugger *dbg = Debugger::task_to_debugger_map[task_port];
+  Debugger::map_mutex.unlock();
+
   dbg->HandleExceptionInternal(mach_exception);
 
-  if (dbg->dbg_continue_status == KERN_SUCCESS) {
-    kern_return_t krt;
-    krt = mach_port_deallocate(mach_task_self(), task_port);
-    if (krt != KERN_SUCCESS) {
-      FATAL("Unable to deallocate task_port, %d\n", krt);
-    }
+  kern_return_t krt;
+  krt = mach_port_deallocate(mach_task_self(), task_port);
+  if (krt != KERN_SUCCESS) {
+    FATAL("Error (%s) deallocating the task port\n", mach_error_string(krt));
+  }
 
-    krt = mach_port_deallocate(mach_task_self(), thread_port);
-    if (krt != KERN_SUCCESS) {
-      FATAL("Unable to deallocate thread_port, %d\n", krt);
-    }
+  krt = mach_port_deallocate(mach_task_self(), thread_port);
+  if (krt != KERN_SUCCESS) {
+    FATAL("Error (%s) deallocating the thread port\n", mach_error_string(krt));
   }
 
   delete mach_exception;
+  mach_exception = NULL;
   return dbg->dbg_continue_status;
+}
+
+void Debugger::OnProcessExit() {
+  if (trace_debug_events) {
+    SAY("Debugger: Process exit\n");
+  }
+
+  map_mutex.lock();
+  task_to_debugger_map.erase(mach_target->Task());
+  map_mutex.unlock();
+
+  if (mach_target != NULL) {
+    mach_target->Exit();
+    delete mach_target;
+    mach_target = NULL;
+  }
 }
 
 
 DebuggerStatus Debugger::Kill() {
-  if (mach_target == NULL || !mach_target->TaskIsValid()) {
+  if (mach_target == NULL) {
     return DEBUGGER_PROCESS_EXIT;
   }
 
-  mach_target->Exit();
-  kill(mach_target->Pid(), SIGKILL);
+  int target_pid = mach_target->Pid();
+  kill(target_pid, SIGKILL);
 
   //SIGKILL is not handled, so DebugLoop must return DEBUGGER_PROCESS_EXIT
   dbg_last_status = DebugLoop(0xffffffff);
-  if (dbg_last_status != DEBUGGER_PROCESS_EXIT || mach_target->TaskIsValid()) {
+  if (dbg_last_status != DEBUGGER_PROCESS_EXIT || IsTargetAlive()) {
     FATAL("Unable to kill the process\n");
+  }
+
+  int status;
+  while(waitpid(target_pid, &status, WNOHANG) == target_pid) {
+//    printf("%d\n", status);
   }
 
   DeleteBreakpoints();
@@ -1178,8 +1213,36 @@ DebuggerStatus Debugger::Kill() {
   return dbg_last_status;
 }
 
+char **Debugger::GetEnvp() {
+  int environ_size = 0;
+  char **p = environ;
+  while (*p) {
+    environ_size += 1;
+    p++;
+  }
 
-void Debugger::StartProcess(char *cmd) {
+  char **envp;
+  envp = (char**)malloc(sizeof(char*)*(environ_size+g_malloc+1));
+  for (int i = 0; i < environ_size; ++i) {
+    envp[i] = (char*)malloc(strlen(environ[i])+1);
+    strcpy(envp[i], environ[i]);
+  }
+
+  if (g_malloc) {
+    envp[environ_size] = (char*)malloc(strlen(GMALLOC_ENV_CONFIG)+1);
+    strcpy(envp[environ_size], GMALLOC_ENV_CONFIG);
+  }
+  envp[environ_size+g_malloc] = NULL;
+
+  return envp;
+}
+
+
+void Debugger::StartProcess(int argc, char **argv) {
+  if (argc <= 0) {
+    FATAL("Number of arguments is not strictly positive");
+  }
+
   pid_t pid;
   int status;
   posix_spawnattr_t attr;
@@ -1194,13 +1257,25 @@ void Debugger::StartProcess(char *cmd) {
     FATAL("Unable to set flags in posix_spawnattr_setflags");
   }
 
-  status = posix_spawn(&pid, cmd, NULL, &attr, NULL, NULL);
+  char **envp = GetEnvp();
+  status = posix_spawn(&pid, argv[0], NULL, &attr, argv, envp);
   if (status != 0) {
-    FATAL("Unable to posix_spawn the process: %s\n", strerror(status));
+    FATAL("Error (%s) spawning the process\n", strerror(status));
   }
 
-  DeleteBreakpoints();
+  for (char **p = envp; *p; p++) {
+    free(*p);
+  }
+  free(envp);
+
   mach_target = new MachTarget(pid);
+
+  dbg_continue_needed = false;
+  dbg_reply_needed = false;
+  child_entrypoint_reached = false;
+  target_reached = false;
+
+  DeleteBreakpoints();
 }
 
 
@@ -1211,7 +1286,10 @@ void Debugger::AttachToProcess() {
     FATAL("Unable to ptrace PT_ATTACHEXC to the target process\n");
   }
 
+  map_mutex.lock();
   task_to_debugger_map[mach_target->Task()] = this;
+  map_mutex.unlock();
+
   dbg_last_status = DEBUGGER_ATTACHED;
 }
 
@@ -1226,13 +1304,17 @@ DebuggerStatus Debugger::Attach(unsigned int pid, uint32_t timeout) {
 
 
 DebuggerStatus Debugger::Run(char *cmd, uint32_t timeout) {
+  FATAL("Deprecated Run interface on macOS - use Run(int argc, char **argv, uint32_t timeout) instead");
+}
+
+
+DebuggerStatus Debugger::Run(int argc, char **argv, uint32_t timeout) {
   attach_mode = false;
 
-  StartProcess(cmd);
+  StartProcess(argc, argv);
   AttachToProcess();
   return Continue(timeout);
 }
-
 
 DebuggerStatus Debugger::Continue(uint32_t timeout) {
   if (loop_mode && (dbg_last_status == DEBUGGER_TARGET_END)) {
@@ -1241,12 +1323,6 @@ DebuggerStatus Debugger::Continue(uint32_t timeout) {
   }
 
   dbg_last_status = DebugLoop(timeout);
-
-  if (dbg_last_status == DEBUGGER_PROCESS_EXIT) {
-    mach_target->Exit();
-    delete mach_target;
-  }
-
   return dbg_last_status;
 }
 
@@ -1258,6 +1334,7 @@ void Debugger::Init(int argc, char **argv) {
   trace_debug_events = false;
   loop_mode = false;
   target_function_defined = false;
+  g_malloc = false;
 
   target_module[0] = 0;
   target_method[0] = 0;
@@ -1268,6 +1345,7 @@ void Debugger::Init(int argc, char **argv) {
   dbg_last_status = DEBUGGER_NONE;
 
   dbg_continue_needed = false;
+  dbg_reply_needed = false;
   request_buffer = (mach_msg_header_t *)malloc(sizeof(union __RequestUnion__catch_mach_exc_subsystem));
   reply_buffer = (mach_msg_header_t *)malloc(sizeof(union __ReplyUnion__catch_mach_exc_subsystem));
 
@@ -1285,9 +1363,7 @@ void Debugger::Init(int argc, char **argv) {
   m_dyld_process_info_get_platform = (uint32_t (*)(void *info))dlsym(
       RTLD_DEFAULT, "_dyld_process_info_get_platform");
 
-  //TO DO parse command line arguments
   char *option;
-
   trace_debug_events = GetBinaryOption("-trace_debug_events",
                                        argc, argv,
                                        trace_debug_events);
@@ -1299,6 +1375,7 @@ void Debugger::Init(int argc, char **argv) {
   if (option) strncpy(target_method, option, PATH_MAX);
 
   loop_mode = GetBinaryOption("-loop", argc, argv, loop_mode);
+  g_malloc = GetBinaryOption("-gmalloc", argc, argv, g_malloc);
 
   option = GetOption("-nargs", argc, argv);
   if (option) target_num_args = atoi(option);
@@ -1318,61 +1395,7 @@ void Debugger::Init(int argc, char **argv) {
     FATAL("Target function needs to be defined to use the loop mode\n");
   }
 
-//
-//  /**
-//   * Add the line below to get debug events on the command line.
-//   */
-//  trace_debug_events = true;
-//
-//  /**
-//   * Change path to your own target's path.
-//   */
-//  char path[] = "/Users/aniculae/Library/Developer/Xcode/DerivedData/LLDB-Test-gykqqxdyxchpaualvtozhjmnahbg/Build/Products/Debug/LLDB-Test";
-//
-//  /**
-//   * Change timeout per DebugLoop.
-//   */
-//  uint32_t timeout = 5000;
-//
-//  /**
-//   * To break when the target function is reached in the target module, add the lines below
-//   * and change the target_module and target_method names as wanted, and update target_num_args
-//   * accordingly.
-//   */
-//  target_function_defined = true;
-//  strcpy(target_module, path);
-//  strcpy(target_method, "__Z1fiiiiiiiii");
-//  loop_mode = true;
-//  target_num_args = 5;
-//
-//
-//
-//  DebuggerStatus dbg_status = Run(path, timeout);
-//  printf("DebugLoop returned DebuggerStatus: %d\n", dbg_status);
-//
-//  if (dbg_status == DEBUGGER_TARGET_START) {
-//    dbg_status = Continue(timeout);
-//    printf("DebugLoop returned DebuggerStatus %d\n", dbg_status);
-//
-//    if (dbg_status == DEBUGGER_TARGET_END) {
-//      dbg_status = Continue(timeout);
-//      printf("DebugLoop returned DebuggerStatus %d\n", dbg_status);
-//
-//      if (dbg_status == DEBUGGER_TARGET_START) {
-//        dbg_status = Continue(timeout);
-//        printf("DebugLoop returned DebuggerStatus %d\n", dbg_status);
-//      }
-//    }
-//  }
-
   if (target_num_args) {
     saved_args = (void **)malloc(target_num_args * sizeof(void *));
   }
 }
-//
-///* TO DO Remove main in the future */
-//int main() {
-//  DebuggerMacOs dbg;
-//  dbg.Init(0, NULL);
-//  return 0;
-//}

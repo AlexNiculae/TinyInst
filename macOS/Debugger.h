@@ -1,19 +1,20 @@
 //
-//  DebuggerMacOs.h
-//  DebuggerMacOs
+//  Debugger.h
+//  TinyInst
 //
 //  Created by Alexandru-Vlad Niculae on 06/07/2020.
 //  Copyright © 2020 Google LLC. All rights reserved.
 //
 
-#ifndef DebuggerOsX_h
-#define DebuggerOsX_h
+#ifndef Debugger_h
+#define Debugger_h
 
 #include <mach-o/loader.h>
 
 #include <limits.h>
 #include <unordered_map>
 #include <list>
+#include <mutex>
 
 #include "MachTarget.h"
 extern "C" {
@@ -62,15 +63,13 @@ friend kern_return_t catch_mach_exception_raise_state_identity(
 public:
   virtual void Init(int argc, char **argv);
   DebuggerStatus Run(char *cmd, uint32_t timeout);
+  DebuggerStatus Run(int argc, char **argv, uint32_t timeout);
   DebuggerStatus Kill();
   DebuggerStatus Continue(uint32_t timeout);
   DebuggerStatus Attach(unsigned int pid, uint32_t timeout);
 
   bool IsTargetAlive() { return (mach_target != NULL && mach_target->TaskIsValid()); };
   bool IsTargetFunctionDefined() { return target_function_defined; };
-
-  static std::unordered_map<task_t, Debugger*> task_to_debugger_map;
-
 
 protected:
   enum MemoryProtection {
@@ -97,8 +96,7 @@ protected:
     R13,
     R14,
     R15,
-    RIP,
-    RFLAGS
+    RIP
   };
 
   enum ExceptionType {
@@ -127,7 +125,7 @@ protected:
   virtual void OnModuleUnloaded(void *module) {}
 
   virtual void OnProcessCreated();
-  virtual void OnProcessExit() {}
+  virtual void OnProcessExit();
 
   virtual void OnEntrypoint();
   virtual void OnTargetMethodReached() {}
@@ -149,7 +147,7 @@ protected:
 
   MachTarget *mach_target;
   void RemoteFree(void *address, size_t size);
-  void RemoteWrite(void *address, void *buffer, size_t size);
+  void RemoteWrite(void *address, const void *buffer, size_t size);
   void RemoteRead(void *address, void *buffer, size_t size);
   void RemoteProtect(void *address, size_t size, MemoryProtection protect);
 
@@ -157,6 +155,7 @@ protected:
   bool trace_debug_events;
   bool attach_mode;
   bool loop_mode;
+  bool g_malloc;
 
   bool child_entrypoint_reached;
   bool target_reached;
@@ -181,6 +180,9 @@ protected:
   virtual size_t GetTranslatedAddress(size_t address) { return address; }
 
 private:
+  static std::unordered_map<task_t, Debugger*> task_to_debugger_map;
+  static std::mutex map_mutex;
+
   struct MachException {
     mach_port_t exception_port;
     mach_port_t thread_port;
@@ -191,8 +193,6 @@ private:
     int *flavor;
     thread_state_t new_state;
     mach_msg_type_number_t *new_stateCnt;
-//    thread_state_t new_state;
-//    mach_msg_type_number_t *new_stateCnt;
 
     MachException();
 
@@ -217,6 +217,7 @@ private:
     {}
   };
 
+  char **GetEnvp();
 
   struct Breakpoint {
     void *address;
@@ -228,7 +229,7 @@ private:
   MachException *mach_exception;
   Exception last_exception;
 
-  void StartProcess(char *cmd);
+  void StartProcess(int argc, char **argv);
   DebuggerStatus DebugLoop(uint32_t timeout);
   void AttachToProcess();
   void HandleExceptionInternal(MachException *mach_exception);
@@ -239,6 +240,7 @@ private:
   kern_return_t dbg_continue_status;
 
   bool dbg_continue_needed;
+  bool dbg_reply_needed;
   mach_msg_header_t *request_buffer;
   mach_msg_header_t *reply_buffer;
 
@@ -310,4 +312,4 @@ private:
 };
 
 
-#endif /* DebuggerOsX_h */
+#endif /* Debugger_h */

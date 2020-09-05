@@ -16,22 +16,15 @@ limitations under the License.
 
 #include <inttypes.h>
 #include <list>
+#include <chrono>
 
 #include "common.h"
 
-#if defined(WIN32) || defined(_WIN32) || defined(__WIN32)
-
 uint64_t GetCurTime(void) {
-  uint64_t ret;
-  FILETIME filetime;
-  GetSystemTimeAsFileTime(&filetime);
-
-  ret = (((uint64_t)filetime.dwHighDateTime) << 32) + (uint64_t)filetime.dwLowDateTime;
-
-  return ret / 10000;
+  auto duration =  std::chrono::system_clock::now().time_since_epoch();
+  auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+  return millis;
 }
-
-#endif // Windows
 
 bool BoolFromOptionValue(char *value) {
   if (_stricmp(value, "off") == 0) return false;
@@ -99,7 +92,7 @@ void GetOptionAll(const char *name, int argc, char** argv, std::list<char *> *re
 int GetIntOption(const char *name, int argc, char** argv, int default_value) {
   char *option = GetOption(name, argc, argv);
   if (!option) return default_value;
-  return strtol(option, NULL, 0);
+  return (int)strtol(option, NULL, 0);
 }
 
 
