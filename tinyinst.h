@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#ifndef LITEINST_H
-#define LITEINST_H
+#ifndef TINYINST_H
+#define TINYINST_H
 
 #include <list>
 #include <set>
@@ -25,7 +25,7 @@ limitations under the License.
 #if defined(WIN32) || defined(_WIN32) || defined(__WIN32)
   #include "Windows/debugger.h"
 #elif __APPLE__
-  #include "macOS/Debugger.h"
+  #include "macOS/debugger.h"
 #endif
 
 #include "common.h"
@@ -272,4 +272,4 @@ private:
   std::list<CrossModuleLink> cross_module_links;
 };
 
-#endif // LITEINST_H
+#endif // TINYINST_H

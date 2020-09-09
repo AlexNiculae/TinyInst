@@ -1,0 +1,7 @@
+/Users/aniculae/Documents/TinyInst/build/CMakeFiles/litecov.dir
+/Users/aniculae/Documents/TinyInst/build/CMakeFiles/tinyinst.dir
+/Users/aniculae/Documents/TinyInst/build/CMakeFiles/ALL_BUILD.dir
+/Users/aniculae/Documents/TinyInst/build/CMakeFiles/ZERO_CHECK.dir
+/Users/aniculae/Documents/TinyInst/build/third_party/CMakeFiles/xed.dir
+/Users/aniculae/Documents/TinyInst/build/third_party/CMakeFiles/ALL_BUILD.dir
+/Users/aniculae/Documents/TinyInst/build/third_party/CMakeFiles/ZERO_CHECK.dir

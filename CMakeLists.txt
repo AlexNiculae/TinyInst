@@ -54,10 +54,10 @@ elseif (APPLE)
   )
 
   set (platform_specific_files
-       macOS/Debugger.h
-       macOS/Debugger.cpp
-       macOS/MachTarget.h
-       macOs/MachTarget.cpp
+       macOS/debugger.h
+       macOS/debugger.cpp
+       macOS/machtarget.h
+       macOs/machtarget.cpp
        macOS/mig_client.h
        macOS/mig_client.c
        macOS/mig_server.h

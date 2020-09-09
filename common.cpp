@@ -97,7 +97,7 @@ int GetIntOption(const char *name, int argc, char** argv, int default_value) {
 
 
 //quoting on Windows is weird
-size_t ArgvWrapperWindows(char *in, char *out) {
+size_t ArgvEscapeWindows(char *in, char *out) {
   int needs_quoting = 0;
   size_t size = 0;
   char *p = in;
@@ -158,7 +158,7 @@ size_t ArgvWrapperWindows(char *in, char *out) {
   return size;
 }
 
-size_t ArgvWrapperMacOS(char *in, char *out) {
+size_t ArgvEscapeMacOS(char *in, char *out) {
   size_t size = 0;
   char *p = in;
   while (*p) {
@@ -183,14 +183,14 @@ char *ArgvToCmd(int argc, char** argv) {
   char* buf, *ret;
 
   for (i = 0; i < argc; i++)
-    len += ArgvWrapper(argv[i], NULL) + 1;
+    len += ArgvEscape(argv[i], NULL) + 1;
 
   if (!len) FATAL("Error creating command line");
 
   buf = ret = (char *)malloc(len);
 
   for (i = 0; i < argc; i++) {
-    size_t l = ArgvWrapper(argv[i], buf);
+    size_t l = ArgvEscape(argv[i], buf);
     buf += l;
     *(buf++) = ' ';
   }

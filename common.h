@@ -21,7 +21,7 @@ limitations under the License.
 
 #if defined(WIN32) || defined(_WIN32) || defined(__WIN32)
     #include <windows.h>
-    #define ArgvWrapper ArgvWrapperWindows
+    #define ArgvEscape ArgvEscapeWindows
 #elif __APPLE__
     #include <limits.h>
     #ifndef MAX_PATH
@@ -31,7 +31,7 @@ limitations under the License.
     #include <strings.h>
     #define _stricmp strcasecmp
 
-    #define ArgvWrapper ArgvWrapperMacOS
+    #define ArgvEscape ArgvEscapeMacOS
 #endif
 
 enum {
