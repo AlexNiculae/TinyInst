@@ -277,12 +277,11 @@ void *Debugger::RemoteAllocateBefore(uint64_t min_address,
 
     if (region_address <= cur_address) { /* cur_address references allocated memory */
       cur_address = region_address;
-    }
-    else { /* cur_address references unallocated memory */
+    } else { /* cur_address references unallocated memory */
       uint64_t free_region_size = region_address - cur_address;
       if (free_region_size >= size) {
         void *ret_address = (void*)(cur_address + (free_region_size - size));
-        kern_return_t krt = RemoteAllocateAt(&ret_address, size);
+        kern_return_t krt = RemoteAllocateAt(ret_address, size);
 
         if (krt == KERN_SUCCESS) {
           if (!(min_address <= (uint64_t)ret_address && (uint64_t)ret_address <= max_address)) {
@@ -292,8 +291,7 @@ void *Debugger::RemoteAllocateBefore(uint64_t min_address,
           RemoteProtect(ret_address, size, protection_flags);
           return ret_address;
         }
-      }
-      else {
+      } else {
         step = size - free_region_size;
       }
     }
@@ -331,7 +329,7 @@ void *Debugger::RemoteAllocateAfter(uint64_t min_address,
     uint64_t free_region_size = region_address - cur_address;
     if (free_region_size >= size) {
       void *ret_address = (void*)cur_address;
-      kern_return_t krt = RemoteAllocateAt(&ret_address, size);
+      kern_return_t krt = RemoteAllocateAt(ret_address, size);
 
       if (krt == KERN_SUCCESS) {
         if (!(min_address <= (uint64_t)ret_address && (uint64_t)ret_address <= max_address)) {
@@ -349,12 +347,12 @@ void *Debugger::RemoteAllocateAfter(uint64_t min_address,
   return NULL;
 }
 
-kern_return_t Debugger::RemoteAllocateAt(void **ret_address, int size) {
+kern_return_t Debugger::RemoteAllocateAt(void *ret_address, int size) {
   kern_return_t krt;
   bool retried = false;
 
 retry_label:
-  void *alloc_address = *ret_address;
+  void *alloc_address = ret_address;
   krt = mach_vm_allocate(mach_target->Task(),
                         (mach_vm_address_t*)&alloc_address,
                         size,
@@ -362,7 +360,7 @@ retry_label:
 
   if (krt == KERN_NO_SPACE && !retried) {
     krt = mach_vm_deallocate(mach_target->Task(),
-                             (mach_vm_address_t)*ret_address,
+                             (mach_vm_address_t)ret_address,
                              size);
     if (krt != KERN_SUCCESS) {
       FATAL("Unable to deallocate memory region starting @ %p, size 0x%x\n",
@@ -373,7 +371,6 @@ retry_label:
     goto retry_label;
   }
 
-  *ret_address = alloc_address;
   return krt;
 }
 
@@ -453,8 +450,7 @@ void Debugger::HandleTargetEnded() {
                   saved_args + 6,
                   child_ptr_size * (target_num_args - 6));
     }
-  }
-  else {
+  } else {
     SetRegister(RIP, (size_t)saved_return_address);
     AddBreakpoint((void*)GetTranslatedAddress((size_t)target_address), BREAKPOINT_TARGET);
   }
@@ -571,8 +567,7 @@ void Debugger::ExtractSegmentCodeRanges(mach_vm_address_t segment_start_addr,
 
           if (krt == KERN_SUCCESS && alloc_address && new_range.from) {
             RemoteWrite((void*)new_range.from, new_range.data, range_size);
-          }
-          else {
+          } else {
             FATAL("Unable to re-allocate memory after deallocate in ExtractCodeRanges\n");
           }
         }
@@ -796,8 +791,7 @@ void Debugger::OnDyldImageNotifier(size_t mode, unsigned long infoCount, uint64_
     for (unsigned long i = 0; i < infoCount; ++i) {
       OnModuleUnloaded((void*)image_info_array[i]);
     }
-  }
-  else {
+  } else {
     dyld_all_image_infos all_image_infos = mach_target->GetAllImageInfos();
     dyld_image_info *all_image_info_array = new dyld_image_info[all_image_infos.infoArrayCount];
     size_t all_image_info_array_size = sizeof(dyld_image_info) * all_image_infos.infoArrayCount;
@@ -808,9 +802,8 @@ void Debugger::OnDyldImageNotifier(size_t mode, unsigned long infoCount, uint64_
       void *mach_header_addr = (void*)all_image_info_array[i].imageLoadAddress;
       if (mode == 2) { /* dyld_notify_remove_all */
         OnModuleUnloaded(mach_header_addr);
-      }
-      else if (std::find(image_info_array, image_info_array + infoCount, (uint64_t)mach_header_addr)
-             != image_info_array + infoCount) {
+      } else if (std::find(image_info_array, image_info_array + infoCount, (uint64_t)mach_header_addr)
+                 != image_info_array + infoCount) {
         /* dyld_image_adding */
         mach_target->ReadCString((uint64_t)all_image_info_array[i].imageFilePath, PATH_MAX, path);
         char *base_name = strrchr((char*)path, '/');
@@ -943,8 +936,7 @@ void Debugger::HandleExceptionInternal(MachException *raised_mach_exception) {
 
         HandleTargetEnded();
         handle_exception_status = DEBUGGER_TARGET_END;
-      }
-      else {
+      } else {
         dbg_continue_status = KERN_FAILURE;
         handle_exception_status = DEBUGGER_CRASHED;
       }
